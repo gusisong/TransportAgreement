@@ -37,7 +37,8 @@ from config import (
 # ---------------------------------------------------------------------------
 # 均匀间隔发送参数（服务器限制：5 封 / 60s 滑动窗口）
 # ---------------------------------------------------------------------------
-SEND_INTERVAL = 12.0        # 每封邮件之间的固定等待（秒）— 60s/5封=12s
+SEND_INTERVAL = 12.0        # 每封邮件之间的基础等待（秒）— 60s/5封=12s
+SEND_JITTER = 1.0           # 随机抖动（秒）— 实际等待 12±1s，防止窗口边界碰撞
 
 # 重试参数（421 兜底）
 MAX_RETRIES = 3             # 最大重试次数
@@ -437,10 +438,11 @@ def main(
         )
         body_html = body_plain.replace("\n", "<br>")
 
-        # 均匀间隔: 第一封不等待，后续每封等待 SEND_INTERVAL 秒
+        # 均匀间隔: 第一封不等待，后续每封等待 SEND_INTERVAL ± SEND_JITTER 秒
         if completed > 0:
-            logging.info(f"等待 {SEND_INTERVAL:.0f}s 后发送下一封 …")
-            _interruptible_sleep(SEND_INTERVAL, stop_event)
+            wait = SEND_INTERVAL + random.uniform(-SEND_JITTER, SEND_JITTER)
+            logging.info(f"等待 {wait:.1f}s 后发送下一封 …")
+            _interruptible_sleep(wait, stop_event)
             if stop_event is not None and stop_event.is_set():
                 result["cancelled"] = True
                 break
