@@ -35,16 +35,26 @@ from config import (
 )
 
 # ---------------------------------------------------------------------------
-# 限流配置（内置默认值，无需用户配置）
+# AIMD 自适应限流参数（Additive Increase / Multiplicative Decrease）
 # ---------------------------------------------------------------------------
-RATE_INITIAL_DELAY = 1.0    # 初始发送间隔（秒）
-RATE_MAX_DELAY = 10.0       # 最大发送间隔（秒）
-RATE_MIN_DELAY = 0.1        # 最小发送间隔（秒）
-EMA_ALPHA = 0.3             # 速率平滑因子
-COOLDOWN_SECONDS = 30.0     # 全局冷却时长（秒）
+INITIAL_DELAY = 3.0         # 初始发送间隔（秒）— 保守开局避免前几封触发 421
+MIN_DELAY = 1.5             # 最小发送间隔（秒）— 服务器硬限制下限
+MAX_DELAY = 30.0            # 最大发送间隔（秒）— 防止失控
+ADDITIVE_DECREASE = 0.3     # 成功时每次减少的间隔（秒）
+MULTIPLICATIVE_INCREASE = 2.0  # 421 失败时间隔倍增因子
+
+# 重试参数
+MAX_RETRIES = 5             # 最大重试次数（增大以覆盖服务器冷却期）
+RETRY_BASE_DELAY = 8.0      # 重试基础退避（秒）— 确保跨过服务器冷却窗口
+RETRY_MAX_DELAY = 60.0      # 重试最大退避（秒）
+
+# 全局冷却
+COOLDOWN_SECONDS = 60.0     # 全局冷却时长（秒）
 THRESHOLD_421 = 3           # 触发冷却的 421 错误次数阈值
-WINDOW_421 = 60.0           # 421 滑动窗口（秒）
-MAX_RETRIES = 3             # 最大重试次数
+WINDOW_421 = 120.0          # 421 滑动窗口（秒）
+
+# 进度 EMA 平滑
+EMA_ALPHA = 0.3             # 速率平滑因子
 
 
 def _setup_logging(root_dir):
@@ -241,21 +251,23 @@ def send_one_email(smtp_config, to_emails, cc_email, subject, body_html, attachm
 
 
 class RateLimiter:
-    def __init__(self, initial_delay=1.0, max_delay=10.0, min_delay=0.1):
+    """AIMD 自适应限流器：成功时线性提速，失败时乘法降速。"""
+
+    def __init__(self, initial_delay=INITIAL_DELAY, max_delay=MAX_DELAY, min_delay=MIN_DELAY):
         self.current_delay = initial_delay
         self.max_delay = max_delay
         self.min_delay = min_delay
-        self.success_count = 0
+        self.consecutive_failures = 0
 
     def on_success(self):
-        self.success_count += 1
-        if self.success_count >= 3:  # 连续成功3次
-            self.current_delay = max(self.min_delay, self.current_delay * 0.9)  # 小幅提速
-            self.success_count = 0
+        """每次成功立即线性减少间隔。"""
+        self.current_delay = max(self.min_delay, self.current_delay - ADDITIVE_DECREASE)
+        self.consecutive_failures = 0
 
     def on_failure(self):
-        self.current_delay = min(self.max_delay, self.current_delay * 2)  # 大幅减速
-        self.success_count = 0
+        """失败时乘法增加间隔。"""
+        self.current_delay = min(self.max_delay, self.current_delay * MULTIPLICATIVE_INCREASE)
+        self.consecutive_failures += 1
 
     def wait(self, stop_event=None):
         """等待当前延迟时长，支持 stop_event 提前中断。"""
@@ -270,6 +282,7 @@ class RateLimiter:
 
 
 def send_one_email_with_rate_limiter(rate_limiter, smtp_config, to_emails, cc_email, subject, body_html, attachment_paths, server=None, stop_event=None):
+    """先等待限流间隔，再发送；根据结果调整限流器。"""
     rate_limiter.wait(stop_event=stop_event)
     success, code, server = send_one_email(smtp_config, to_emails, cc_email, subject, body_html, attachment_paths, server=server)
     if success:
@@ -279,31 +292,49 @@ def send_one_email_with_rate_limiter(rate_limiter, smtp_config, to_emails, cc_em
     return success, code, server
 
 
-def send_with_retries(rate_limiter, smtp_config, to_emails, cc_email, subject, body_html, attachment_paths, max_retries=3, server=None, stop_event=None):
-    """Send with exponential backoff retries.
+def send_with_retries(rate_limiter, smtp_config, to_emails, cc_email, subject, body_html, attachment_paths, max_retries=MAX_RETRIES, server=None, stop_event=None):
+    """发送邮件，失败后以较长退避间隔重试（确保跨过服务器冷却期）。
 
-    Returns tuple (success: bool, last_error_code: Optional[int], server: Optional[smtplib.SMTP]).
-    The first attempt respects rate_limiter; subsequent retries do not re-run the full rate_limiter.wait
-    to avoid double waiting.
+    首次尝试遵循 rate_limiter 间隔；后续重试使用独立的指数退避（8s 起步）。
+    Returns tuple (success, last_error_code, server).
     """
-    delay = 1.0
     last_code = None
-    # first attempt with rate limiter
-    success, code, server = send_one_email_with_rate_limiter(rate_limiter, smtp_config, to_emails, cc_email, subject, body_html, attachment_paths, server=server, stop_event=stop_event)
+    # 首次尝试（含限流等待）
+    success, code, server = send_one_email_with_rate_limiter(
+        rate_limiter, smtp_config, to_emails, cc_email, subject, body_html,
+        attachment_paths, server=server, stop_event=stop_event,
+    )
     if success:
         return True, None, server
     last_code = code
-    attempt = 1
-    while attempt < max_retries:
-        # exponential backoff with jitter
+
+    # 重试：退避 8s → 16s → 32s → 60s → 60s
+    retry_delay = RETRY_BASE_DELAY
+    for attempt in range(1, max_retries):
+        if stop_event is not None and stop_event.is_set():
+            break
         jitter = random.uniform(0.8, 1.2)
-        time.sleep(delay * jitter)
-        success, code, server = send_one_email(smtp_config, to_emails, cc_email, subject, body_html, attachment_paths, server=server)
+        wait_time = retry_delay * jitter
+        logging.info(f"第 {attempt}/{max_retries-1} 次重试，等待 {wait_time:.1f}s …")
+        # 可中断的等待
+        remaining = wait_time
+        while remaining > 0:
+            if stop_event is not None and stop_event.is_set():
+                return False, last_code, server
+            s = min(0.5, remaining)
+            time.sleep(s)
+            remaining -= s
+        success, code, server = send_one_email(
+            smtp_config, to_emails, cc_email, subject, body_html,
+            attachment_paths, server=server,
+        )
         if success:
+            # 重试成功也通知限流器，帮助恢复
+            rate_limiter.on_success()
             return True, None, server
         last_code = code
-        attempt += 1
-        delay = min(delay * 2, 30)
+        retry_delay = min(retry_delay * 2, RETRY_MAX_DELAY)
+
     return False, last_code, server
 
 
@@ -406,7 +437,7 @@ def main(
         logging.info("没有需要发送的任务。")
         return result
 
-    rate_limiter = RateLimiter(initial_delay=RATE_INITIAL_DELAY, max_delay=RATE_MAX_DELAY, min_delay=RATE_MIN_DELAY)
+    rate_limiter = RateLimiter(initial_delay=INITIAL_DELAY, max_delay=MAX_DELAY, min_delay=MIN_DELAY)
     start_time = time.time()
     completed = 0
     # exponential moving average for rate smoothing
