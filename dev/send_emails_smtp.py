@@ -35,18 +35,13 @@ from config import (
 )
 
 # ---------------------------------------------------------------------------
-# 动态节拍式发送参数（Burst Pacing）
+# 均匀间隔发送参数（服务器限制：5 封 / 60s 滑动窗口）
 # ---------------------------------------------------------------------------
-BURST_SIZE = 5              # 每轮连发封数
-BURST_PAUSE_INITIAL = 10.0  # 初始轮间暂停（秒）
-BURST_PAUSE_MIN = 3.0       # 最小轮间暂停（秒）
-BURST_PAUSE_MAX = 60.0      # 最大轮间暂停（秒）
-BURST_PAUSE_DECREASE = 0.5  # 无 421 时每轮缩短（秒）
-BURST_PAUSE_MULTIPLY = 2.0  # 触发 421 时暂停倍增因子
+SEND_INTERVAL = 12.0        # 每封邮件之间的固定等待（秒）— 60s/5封=12s
 
 # 重试参数（421 兜底）
-MAX_RETRIES = 5             # 最大重试次数
-RETRY_BASE_DELAY = 30.0     # 重试基础退避（秒）— 首次重试跨过 30-40s 冷却窗口
+MAX_RETRIES = 3             # 最大重试次数
+RETRY_BASE_DELAY = 60.0     # 重试退避（秒）— 等待整个 60s 窗口滑过
 RETRY_MAX_DELAY = 60.0      # 重试最大退避（秒）
 
 # 进度 EMA 平滑
@@ -269,54 +264,6 @@ def send_one_email(smtp_config, to_emails, cc_email, subject, body_html, attachm
         return False, None, None
 
 
-class BurstPacer:
-    """动态节拍式限流器：每 BURST_SIZE 封后主动暂停，暂停时间自适应。
-
-    - 一轮无 421：缩短暂停（线性减少 BURST_PAUSE_DECREASE）
-    - 一轮有 421：延长暂停（乘 BURST_PAUSE_MULTIPLY）
-    """
-
-    def __init__(self):
-        self.pause = BURST_PAUSE_INITIAL
-        self.burst_count = 0        # 当前轮已发送数
-        self.burst_had_421 = False  # 当前轮是否触发过 421
-
-    def before_send(self, stop_event=None):
-        """每封发送前调用。如果达到 BURST_SIZE 则暂停并调整。"""
-        if self.burst_count >= BURST_SIZE:
-            self._do_pause(stop_event)
-
-    def on_send_result(self, success, error_code):
-        """每封发送后调用（仅首次尝试，不含重试）。"""
-        self.burst_count += 1
-        if not success and error_code == 421:
-            self.burst_had_421 = True
-
-    def on_retry_421(self):
-        """重试中遇到 421 时调用，标记当前轮有 421。"""
-        self.burst_had_421 = True
-
-    def _do_pause(self, stop_event=None):
-        """执行轮间暂停并调整暂停时长。"""
-        # 根据上一轮结果调整
-        if self.burst_had_421:
-            old = self.pause
-            self.pause = min(BURST_PAUSE_MAX, self.pause * BURST_PAUSE_MULTIPLY)
-            logging.info(f"[节拍] 上轮触发421，暂停延长 {old:.1f}s → {self.pause:.1f}s")
-        else:
-            old = self.pause
-            self.pause = max(BURST_PAUSE_MIN, self.pause - BURST_PAUSE_DECREASE)
-            logging.info(f"[节拍] 上轮全部成功，暂停缩短 {old:.1f}s → {self.pause:.1f}s")
-
-        # 执行暂停
-        logging.info(f"[节拍] 已完成 {self.burst_count} 封，暂停 {self.pause:.1f}s …")
-        _interruptible_sleep(self.pause, stop_event)
-
-        # 重置轮计数
-        self.burst_count = 0
-        self.burst_had_421 = False
-
-
 def _interruptible_sleep(seconds, stop_event=None):
     """可被 stop_event 中断的等待。"""
     remaining = seconds
@@ -329,8 +276,8 @@ def _interruptible_sleep(seconds, stop_event=None):
 
 
 def send_with_retries(smtp_config, to_emails, cc_email, subject, body_html, attachment_paths,
-                     max_retries=MAX_RETRIES, server=None, stop_event=None, pacer=None):
-    """发送邮件，失败后以指数退避重试（30s 起步，确保跨过服务器冷却期）。
+                     max_retries=MAX_RETRIES, server=None, stop_event=None):
+    """发送邮件，失败后等待 60s 重试（等待整个滑动窗口滑过）。
 
     Returns tuple (success, last_error_code, server).
     """
@@ -343,17 +290,12 @@ def send_with_retries(smtp_config, to_emails, cc_email, subject, body_html, atta
         return True, None, server
     last_code = code
 
-    # 通知 pacer 首次失败
-    if pacer and code == 421:
-        pacer.on_retry_421()
-
-    # 重试：退避 30s → 60s → 60s → ...
-    retry_delay = RETRY_BASE_DELAY
+    # 重试：固定 60s（等待滑动窗口完全滑过）
     for attempt in range(1, max_retries):
         if stop_event is not None and stop_event.is_set():
             break
         jitter = random.uniform(0.8, 1.2)
-        wait_time = retry_delay * jitter
+        wait_time = RETRY_BASE_DELAY * jitter
         logging.info(f"第 {attempt}/{max_retries-1} 次重试，等待 {wait_time:.1f}s …")
         _interruptible_sleep(wait_time, stop_event)
         if stop_event is not None and stop_event.is_set():
@@ -365,9 +307,6 @@ def send_with_retries(smtp_config, to_emails, cc_email, subject, body_html, atta
         if success:
             return True, None, server
         last_code = code
-        if pacer and code == 421:
-            pacer.on_retry_421()
-        retry_delay = min(retry_delay * 2, RETRY_MAX_DELAY)
 
     return False, last_code, server
 
@@ -471,7 +410,6 @@ def main(
         logging.info("没有需要发送的任务。")
         return result
 
-    pacer = BurstPacer()
     start_time = time.time()
     completed = 0
     # exponential moving average for rate smoothing
@@ -499,11 +437,13 @@ def main(
         )
         body_html = body_plain.replace("\n", "<br>")
 
-        # 节拍控制：达到 BURST_SIZE 时自动暂停
-        pacer.before_send(stop_event=stop_event)
-        if stop_event is not None and stop_event.is_set():
-            result["cancelled"] = True
-            break
+        # 均匀间隔: 第一封不等待，后续每封等待 SEND_INTERVAL 秒
+        if completed > 0:
+            logging.info(f"等待 {SEND_INTERVAL:.0f}s 后发送下一封 …")
+            _interruptible_sleep(SEND_INTERVAL, stop_event)
+            if stop_event is not None and stop_event.is_set():
+                result["cancelled"] = True
+                break
 
         # 确保 SMTP 连接可用（含重试）
         if smtp_server is None:
@@ -531,11 +471,7 @@ def main(
             max_retries=MAX_RETRIES,
             server=smtp_server,
             stop_event=stop_event,
-            pacer=pacer,
         )
-
-        # 通知 pacer 本封结果（用于轮内 421 追踪）
-        pacer.on_send_result(success, last_code)
 
         if success:
             result["success"] += 1
