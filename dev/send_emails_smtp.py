@@ -45,7 +45,7 @@ MULTIPLICATIVE_INCREASE = 2.0  # 421 失败时间隔倍增因子
 
 # 重试参数
 MAX_RETRIES = 5             # 最大重试次数（增大以覆盖服务器冷却期）
-RETRY_BASE_DELAY = 8.0      # 重试基础退避（秒）— 确保跨过服务器冷却窗口
+RETRY_BASE_DELAY = 20.0     # 重试基础退避（秒）— 首次重试即跨过服务器冷却窗口
 RETRY_MAX_DELAY = 60.0      # 重试最大退避（秒）
 
 # 全局冷却
