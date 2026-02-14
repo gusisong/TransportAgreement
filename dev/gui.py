@@ -8,7 +8,7 @@
 import os
 import sys
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext
 import configparser
 import threading
 
@@ -220,30 +220,16 @@ def list_project_folders(root_dir):
 class App:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("运输协议邮件外发 — 配置与日志")
+        self.root.title("运输协议邮件外发")
         self.root.minsize(520, 420)
-        self._root_dir = tk.StringVar(value=_default_root_dir())
+        self._root_dir_value = _default_root_dir()
 
         self._build_ui()
 
     def _root(self):
-        return self._root_dir.get().strip() or _default_root_dir()
+        return self._root_dir_value
 
     def _build_ui(self):
-        # 顶部：工作根目录
-        top = ttk.Frame(self.root, padding="8 4")
-        top.pack(fill=tk.X)
-        ttk.Label(top, text="工作根目录:").pack(side=tk.LEFT, padx=(0, 4))
-        root_entry = ttk.Entry(top, textvariable=self._root_dir, width=50)
-        root_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-
-        def browse():
-            d = filedialog.askdirectory(title="选择工作根目录", initialdir=self._root())
-            if d:
-                self._root_dir.set(d)
-
-        ttk.Button(top, text="浏览…", command=browse).pack(side=tk.LEFT, padx=2)
-
         # 选项卡
         self._nb = ttk.Notebook(self.root)
         self._nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
@@ -312,40 +298,6 @@ class App:
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(1, weight=1)
 
-        # 5) 限流配置
-        rate_limit_frame = ttk.Frame(nb, padding=8)
-        nb.add(rate_limit_frame, text="限流配置")
-
-        ttk.Label(rate_limit_frame, text="最大速率 (邮件/秒):").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self._max_rate = ttk.Entry(rate_limit_frame, width=20)
-        self._max_rate.grid(row=0, column=1, sticky=tk.W, pady=2)
-        self._max_rate.insert(0, "0.5")
-
-        ttk.Label(rate_limit_frame, text="最小间隔时间 (秒):").grid(row=1, column=0, sticky=tk.W, pady=2)
-        self._min_interval = ttk.Entry(rate_limit_frame, width=20)
-        self._min_interval.grid(row=1, column=1, sticky=tk.W, pady=2)
-        self._min_interval.insert(0, "1.0")
-
-        ttk.Button(rate_limit_frame, text="保存配置", command=self._on_save_rate_limit).grid(row=2, column=0, columnspan=2, pady=8)
-        ttk.Label(rate_limit_frame, text="说明：最大速率控制整体平均发送速度（封/秒）。示例：0.5 表示平均每 2 秒 1 封；最小间隔优先于最大速率，推荐批量发送时设置为 1.0 秒。", foreground="gray").grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(4,0))
-
-        # 速率平滑（EMA）和 421 冷却参数（高级可调）
-        ttk.Label(rate_limit_frame, text="速率平滑 (EMA alpha, 0-1):").grid(row=4, column=0, sticky=tk.W, pady=2)
-        self.ema_alpha_var = tk.DoubleVar(value=0.3)
-        ttk.Entry(rate_limit_frame, textvariable=self.ema_alpha_var, width=20).grid(row=4, column=1, sticky=tk.W, pady=2)
-
-        ttk.Label(rate_limit_frame, text="触发全局冷却的 421 阈值:").grid(row=5, column=0, sticky=tk.W, pady=2)
-        self._421_threshold_var = tk.IntVar(value=3)
-        ttk.Entry(rate_limit_frame, textvariable=self._421_threshold_var, width=20).grid(row=5, column=1, sticky=tk.W, pady=2)
-
-        ttk.Label(rate_limit_frame, text="421 窗口 (秒):").grid(row=6, column=0, sticky=tk.W, pady=2)
-        self._421_window_var = tk.DoubleVar(value=60.0)
-        ttk.Entry(rate_limit_frame, textvariable=self._421_window_var, width=20).grid(row=6, column=1, sticky=tk.W, pady=2)
-
-        ttk.Label(rate_limit_frame, text="全局冷却时长 (秒):").grid(row=7, column=0, sticky=tk.W, pady=2)
-        self.cooldown_seconds_var = tk.DoubleVar(value=30.0)
-        ttk.Entry(rate_limit_frame, textvariable=self.cooldown_seconds_var, width=20).grid(row=7, column=1, sticky=tk.W, pady=2)
-
         # 底部：包含进度条（左）、剩余时间（中）、开始批量发送按钮（右）
         bottom = ttk.Frame(self.root, padding="8 8")
         bottom.pack(fill=tk.X)
@@ -402,7 +354,7 @@ class App:
         if not self._project_vars:
             ttk.Label(
                 self._proj_check_frame,
-                text="（当前根目录下没有以「项目」结尾的文件夹，请先创建或更换工作根目录）",
+                text="（当前根目录下没有以「项目」结尾的文件夹，请先创建）",
                 foreground="gray",
             ).pack(anchor=tk.W)
 
@@ -420,7 +372,7 @@ class App:
             )
             self._nb.select(self._proj_tab_index)
             return
-        # run sending in a background thread and pass a progress callback
+        # run sending in a background thread
         def worker():
             try:
                 _root = self._root()
@@ -437,11 +389,6 @@ class App:
                     project_names=selected,
                     progress_callback=self._progress_callback,
                     stop_event=self._stop_event,
-                    max_retries=3,
-                    ema_alpha=self.ema_alpha_var.get(),
-                    _421_threshold=self._421_threshold_var.get(),
-                    _421_window=self._421_window_var.get(),
-                    cooldown_seconds=self.cooldown_seconds_var.get(),
                 )
                 # notify and refresh logs on main thread
                 self.root.after(0, lambda: messagebox.showinfo("批量发送", "发送任务已执行，请到「日志」选项卡查看结果。"))
@@ -503,6 +450,7 @@ class App:
             messagebox.showinfo("SMTP", "已保存到 smtp_config.ini。")
         else:
             messagebox.showerror("SMTP", "保存失败，请检查工作根目录是否有效。")
+
     def _on_load_signature(self):
         content = load_signature(self._root())
         self._sig_text.delete("1.0", tk.END)
@@ -530,87 +478,12 @@ class App:
         self._log_text.delete("1.0", tk.END)
         self._log_text.insert("1.0", content)
 
-    def _on_save_rate_limit(self):
-        max_rate = self._max_rate.get().strip()
-        min_interval = self._min_interval.get().strip()
-        try:
-            max_rate = float(max_rate)
-            min_interval = float(min_interval)
-            # 保存到配置文件（包含高级参数）
-            ok = save_rate_limit_config(
-                self._root(),
-                ema_alpha=self.ema_alpha_var.get(),
-                _421_threshold=self._421_threshold_var.get(),
-                _421_window=self._421_window_var.get(),
-                cooldown_seconds=self.cooldown_seconds_var.get(),
-            )
-            if ok:
-                messagebox.showinfo("限流配置", f"已保存: 最大速率={max_rate}邮件/秒, 最小间隔={min_interval}秒，以及高级参数已保存。")
-            else:
-                messagebox.showwarning("限流配置", "保存限流配置到文件失败，但界面值已生效（未持久化）。")
-        except ValueError:
-            messagebox.showerror("限流配置", "请输入有效的数字值。")
-
     def run(self):
         self._on_load_smtp()
         self._on_load_signature()
-        # load saved advanced rate-limit settings (if any)
-        try:
-            rl = load_rate_limit_config(self._root())
-            self.ema_alpha_var.set(rl.get("ema_alpha", 0.3))
-            self._421_threshold_var.set(rl.get("_421_threshold", 3))
-            self._421_window_var.set(rl.get("_421_window", 60.0))
-            self.cooldown_seconds_var.set(rl.get("cooldown_seconds", 30.0))
-        except Exception:
-            pass
         self._on_refresh_projects()
         self._on_refresh_log()
         self.root.mainloop()
-
-
-def load_rate_limit_config(root_dir):
-    """
-    从 smtp_config.ini 读取限流相关的高级参数（若不存在则返回默认值）。
-    返回 dict: ema_alpha, _421_threshold, _421_window, cooldown_seconds
-    """
-    path = _config_path(root_dir)
-    cfg = configparser.ConfigParser()
-    if not os.path.isfile(path):
-        return {"ema_alpha": 0.3, "_421_threshold": 3, "_421_window": 60.0, "cooldown_seconds": 30.0}
-    try:
-        cfg.read(path, encoding="utf-8")
-        if not cfg.has_section(SMTP_SECTION):
-            return {"ema_alpha": 0.3, "_421_threshold": 3, "_421_window": 60.0, "cooldown_seconds": 30.0}
-        return {
-            "ema_alpha": cfg.getfloat(SMTP_SECTION, "ema_alpha", fallback=0.3),
-            "_421_threshold": cfg.getint(SMTP_SECTION, "_421_threshold", fallback=3),
-            "_421_window": cfg.getfloat(SMTP_SECTION, "_421_window", fallback=60.0),
-            "cooldown_seconds": cfg.getfloat(SMTP_SECTION, "cooldown_seconds", fallback=30.0),
-        }
-    except Exception:
-        return {"ema_alpha": 0.3, "_421_threshold": 3, "_421_window": 60.0, "cooldown_seconds": 30.0}
-
-
-def save_rate_limit_config(root_dir, ema_alpha, _421_threshold, _421_window, cooldown_seconds):
-    """
-    将限流高级参数写入 smtp_config.ini 的 [smtp] 节（创建文件或节如果不存在）。
-    """
-    path = _config_path(root_dir)
-    cfg = configparser.ConfigParser()
-    try:
-        if os.path.isfile(path):
-            cfg.read(path, encoding="utf-8")
-        if not cfg.has_section(SMTP_SECTION):
-            cfg.add_section(SMTP_SECTION)
-        cfg.set(SMTP_SECTION, "ema_alpha", str(float(ema_alpha)))
-        cfg.set(SMTP_SECTION, "_421_threshold", str(int(_421_threshold)))
-        cfg.set(SMTP_SECTION, "_421_window", str(float(_421_window)))
-        cfg.set(SMTP_SECTION, "cooldown_seconds", str(float(cooldown_seconds)))
-        with open(path, "w", encoding="utf-8") as f:
-            cfg.write(f)
-        return True
-    except Exception:
-        return False
 
 
 def main():

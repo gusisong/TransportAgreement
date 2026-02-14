@@ -29,6 +29,18 @@ CSV_FILENAME = "EmailAddress.csv"
 SIGNATURE_FILENAME = "Signature.txt"
 SKIP_NAMES = ("已外发", "待外发")
 
+# ---------------------------------------------------------------------------
+# 限流配置（内置默认值，无需用户配置）
+# ---------------------------------------------------------------------------
+RATE_INITIAL_DELAY = 1.0    # 初始发送间隔（秒）
+RATE_MAX_DELAY = 10.0       # 最大发送间隔（秒）
+RATE_MIN_DELAY = 0.1        # 最小发送间隔（秒）
+EMA_ALPHA = 0.3             # 速率平滑因子
+COOLDOWN_SECONDS = 30.0     # 全局冷却时长（秒）
+THRESHOLD_421 = 3           # 触发冷却的 421 错误次数阈值
+WINDOW_421 = 60.0           # 421 滑动窗口（秒）
+MAX_RETRIES = 3             # 最大重试次数
+
 
 def _setup_logging(root_dir):
     """配置日志：写入根目录下 email_smtp_log.log，UTF-8。"""
@@ -282,14 +294,6 @@ def main(
     project_names=None,
     progress_callback=None,
     stop_event=None,
-    max_retries=3,
-    initial_delay=1.0,
-    min_delay=0.1,
-    max_delay=10.0,
-    cooldown_seconds=30,
-    _421_threshold=3,
-    _421_window=60.0,
-    ema_alpha=0.3,
 ):
     """
     主流程：读取配置与数据，遍历项目，按供应商发送邮件，成功后移动文件并写日志。
@@ -305,56 +309,6 @@ def main(
         logging.error("SMTP 配置缺失或无效，退出。")
         return
 
-    # 如果调用方（例如直接脚本运行）没有显式传入高级参数，
-    # 则尝试从 smtp_config.ini 的 [smtp] 节读取这些值作为默认覆盖。
-    try:
-        cfg = configparser.ConfigParser()
-        cfg_path = os.path.join(root_dir, "dev", CONFIG_FILENAME)
-        if not os.path.isfile(cfg_path):
-            cfg_path = os.path.join(root_dir, CONFIG_FILENAME)
-        if os.path.isfile(cfg_path):
-            cfg.read(cfg_path, encoding="utf-8")
-            if cfg.has_section(SMTP_SECTION):
-                s = cfg[SMTP_SECTION]
-                # Only override when the parameter still equals its function default
-                try:
-                    if ema_alpha == 0.3:
-                        ema_alpha = float(s.get("ema_alpha", ema_alpha))
-                except Exception:
-                    pass
-                try:
-                    if _421_threshold == 3:
-                        _421_threshold = int(s.get("_421_threshold", _421_threshold))
-                except Exception:
-                    pass
-                try:
-                    if _421_window == 60.0:
-                        _421_window = float(s.get("_421_window", _421_window))
-                except Exception:
-                    pass
-                try:
-                    if cooldown_seconds == 30:
-                        cooldown_seconds = float(s.get("cooldown_seconds", cooldown_seconds))
-                except Exception:
-                    pass
-                try:
-                    if initial_delay == 1.0:
-                        initial_delay = float(s.get("initial_delay", initial_delay))
-                except Exception:
-                    pass
-                try:
-                    if min_delay == 0.1:
-                        min_delay = float(s.get("min_delay", min_delay))
-                except Exception:
-                    pass
-                try:
-                    if max_delay == 10.0:
-                        max_delay = float(s.get("max_delay", max_delay))
-                except Exception:
-                    pass
-    except Exception:
-        # 不应阻塞主流程，忽略配置读取错误
-        pass
 
     email_addresses = read_email_addresses(root_dir)
     signature = read_signature(root_dir)
@@ -398,7 +352,7 @@ def main(
         logging.info("没有需要发送的任务。")
         return
 
-    rate_limiter = RateLimiter(initial_delay=initial_delay, max_delay=max_delay, min_delay=min_delay)
+    rate_limiter = RateLimiter(initial_delay=RATE_INITIAL_DELAY, max_delay=RATE_MAX_DELAY, min_delay=RATE_MIN_DELAY)
     start_time = time.time()
     completed = 0
     # exponential moving average for rate smoothing
@@ -440,7 +394,7 @@ def main(
             subject,
             body_html,
             files,
-            max_retries=max_retries,
+            max_retries=MAX_RETRIES,
         )
 
         if success:
@@ -458,11 +412,11 @@ def main(
             if last_code == 421:
                 recent_421.append(now)
                 # remove old
-                while recent_421 and now - recent_421[0] > _421_window:
+                while recent_421 and now - recent_421[0] > WINDOW_421:
                     recent_421.popleft()
-                if len(recent_421) >= _421_threshold:
-                    cooldown_until = now + cooldown_seconds
-                    logging.warning(f"检测到连续 {_421_threshold} 次 421，触发全局冷却 {cooldown_seconds}s")
+                if len(recent_421) >= THRESHOLD_421:
+                    cooldown_until = now + COOLDOWN_SECONDS
+                    logging.warning(f"检测到连续 {THRESHOLD_421} 次 421，触发全局冷却 {COOLDOWN_SECONDS}s")
 
             # 重试全部失败后，将这些文件移动到项目下的 failed/ 以便人工处理
             failed_dir = os.path.join(root_dir, project_folder, "failed")
@@ -485,7 +439,7 @@ def main(
             if rate_ema is None:
                 rate_ema = inst_rate
             else:
-                rate_ema = ema_alpha * inst_rate + (1 - ema_alpha) * rate_ema
+                rate_ema = EMA_ALPHA * inst_rate + (1 - EMA_ALPHA) * rate_ema
             rate = rate_ema
             eta_seconds = (total - completed) / rate if rate > 0 else None
             percent = (completed / total) * 100.0

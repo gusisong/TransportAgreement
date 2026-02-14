@@ -12,11 +12,11 @@
 
 ## 2. 运行环境与依赖
 
-| 项目 | 说明 |
-|------|------|
-| 运行环境 | **跨平台**（含 Linux），不依赖 Windows 或 Outlook |
+| 项目      | 说明                                                                                                             |
+| --------- | ---------------------------------------------------------------------------------------------------------------- |
+| 运行环境  | **跨平台**（含 Linux），不依赖 Windows 或 Outlook                                                                |
 | Python 库 | **仅使用标准库**：`smtplib`、`email`、`os`、`logging`、`shutil`、`csv`、`configparser`；不依赖 pandas 等第三方库 |
-| 前置条件 | 本机可访问企业 SMTP 服务器（如 `smtp.csvw.com`），且已具备有效的 SMTP 配置文件 |
+| 前置条件  | 本机可访问企业 SMTP 服务器（如 `smtp.csvw.com`），且已具备有效的 SMTP 配置文件                                   |
 
 **说明**：`EmailAddress.csv` 使用标准库 `csv` 解析，保证列顺序、编码与现有格式一致，便于在无第三方库环境下运行。
 
@@ -47,9 +47,8 @@
 
 与《需求文档.md》一致：
 
-- **根目录**：即“工作根目录”；用户仅需在根目录维护 **EmailAddress.csv**；smtp_config.ini、Signature.txt 可由 GUI 在工作根目录下保存生成。
-- **根目录下**需存在：EmailAddress.csv；Signature.txt、smtp_config.ini 可在首次使用时通过 GUI 保存生成。
- - **根目录下**需存在：`EmailAddress.csv`；默认情况下 `smtp_config.ini` 与 `Signature.txt` 存放在 `dev/` 子目录中以减少根目录杂乱。GUI 在启动时会优先从 `dev/` 查找这两个文件，若未找到则回退到根目录以兼容旧版布局。
+- **根目录**：即"工作根目录"；用户仅需在根目录维护 **EmailAddress.csv**；smtp_config.ini、Signature.txt 可由 GUI 在工作根目录下保存生成。
+- **根目录下**需存在：`EmailAddress.csv`；默认情况下 `smtp_config.ini` 与 `Signature.txt` 存放在 `dev/` 子目录中以减少根目录杂乱。GUI 在启动时会优先从 `dev/` 查找这两个文件，若未找到则回退到根目录以兼容旧版布局。
 - **项目文件夹**：根目录下以「项目」结尾的子文件夹，各含「待外发」「已外发」。
 - 脚本与文档位于 **dev/**，用户无需关注。
 
@@ -116,11 +115,18 @@
 
 ## 14. 图形界面（GUI）
 
-- 入口 gui.py；工作根目录可选（打包后默认 exe 目录）。**项目管理**：展示以「项目」结尾的文件夹并勾选；新建项目可自动补全「项目」；创建成功后自动刷新列表；未选项目时「开始批量发送」提示并引导至项目管理。**开始批量发送**：底部居中；已选项目则执行批量发送。
+- 入口 gui.py；工作根目录自动检测（打包后默认 exe 目录，开发时默认项目根目录），用户无需手动配置。
+- **SMTP 账号**：维护 smtp_config.ini 的 username、password。
+- **邮件签名**：编辑并保存 Signature.txt。
+- **项目管理**：展示以「项目」结尾的文件夹并勾选；新建项目可自动补全「项目」；创建成功后自动刷新列表；未选项目时「开始批量发送」提示并引导至项目管理。
+- **日志**：查看 email_smtp_log.log。
+- **开始批量发送**：底部按钮；已选项目则执行批量发送，附进度条与预估剩余时间。
 
 本文档与当前实现（send_emails_smtp.py、gui.py）保持一致；需求变更时请同步更新本文档。
 
 ### 自适应限流策略
+
+限流参数已内置于 `send_emails_smtp.py` 中作为模块级常量，用户无需配置。
 
 1. **单线程/单连接发送**：
    - 所有邮件通过单一线程和单一SMTP连接发送，避免并发导致的限流问题。
@@ -135,41 +141,39 @@
 4. **全局状态管理**：
    - 使用全局速率控制器（RateLimiter）管理发送速率，所有任务共享同一控制器。
 
-### 配置参数
-- **初始延迟时间**：1秒
-- **最大延迟时间**：10秒
-- **最小延迟时间**：0.1秒
-- **连续成功提速阈值**：3次
-### 示例日志
-```
-2026-02-13 10:00:00 INFO Email sent to user@example.com
-2026-02-13 10:01:02 INFO Retrying email to user2@example.com (Attempt 2)
-```
+### 内置限流参数
 
-### 15. 新增功能
+以下参数作为代码常量定义在 `send_emails_smtp.py` 中，无需用户配置：
+
+| 参数               | 值    | 说明                |
+| ------------------ | ----- | ------------------- |
+| RATE_INITIAL_DELAY | 1.0s  | 初始发送间隔        |
+| RATE_MAX_DELAY     | 10.0s | 最大发送间隔        |
+| RATE_MIN_DELAY     | 0.1s  | 最小发送间隔        |
+| EMA_ALPHA          | 0.3   | 速率平滑因子        |
+| COOLDOWN_SECONDS   | 30.0s | 全局冷却时长        |
+| THRESHOLD_421      | 3     | 触发冷却的 421 阈值 |
+| WINDOW_421         | 60.0s | 421 滑动窗口        |
+| MAX_RETRIES        | 3     | 最大重试次数        |
+
+### 15. 进度与预估时间
 
 - **功能**：
   - 显示当前发送进度（按供应商号计算百分比）。
-   - 显示预估剩余时间（放置于进度条右侧）。
+  - 显示预估剩余时间（放置于进度条右侧）。
 - **实现**：
-  - 使用 `ttk.Progressbar` 实现进度条。
-   - 使用 `ttk.Label` 在进度条中央显示百分比覆盖文本，`ttk.Progressbar` 使用绿色主题。  
-   - 进度更新通过 `send_emails_smtp.main` 提供的回调接口驱动（见下文）。
-- **位置**：GUI 新增「限流配置」选项卡。
-- **功能**：
-  - 用户可自定义最大发送速率（邮件/秒）。
-  - 用户可自定义最小间隔时间（秒）。
-- **实现**：
-  - 配置保存后即时生效。
+  - 使用 `ttk.Progressbar` 实现进度条，绿色主题。
+  - 使用 `ttk.Label` 在进度条中央显示百分比覆盖文本。
+  - 进度更新通过 `send_emails_smtp.main` 提供的回调接口驱动。
 
 ### 16. 进度回调接口
 
 - **目的**：GUI 需要在邮件外发过程中实时显示进度（按供应商号）、发送速率与预估剩余时间。为此，`send_emails_smtp.main` 提供一个可选的进度回调参数 `progress_callback`。
 - **函数签名**：`progress_callback(percent: float, rate: float, eta_seconds: Optional[float], completed: int, total: int) -> None`。
-   - `percent`：0-100 的浮点数表示完成百分比。
-   - `rate`：当前平均发送速率（单位：邮件/秒）。
-   - `eta_seconds`：估计剩余秒数，若无法估计则为 `None`。
-   - `completed` / `total`：已完成与总任务数（按供应商号计数）。
+  - `percent`：0-100 的浮点数表示完成百分比。
+  - `rate`：当前平均发送速率（单位：邮件/秒）。
+  - `eta_seconds`：估计剩余秒数，若无法估计则为 `None`。
+  - `completed` / `total`：已完成与总任务数（按供应商号计数）。
 - **调用时机**：每处理完一个供应商号（成功或失败后）调用一次。
 
 ```python
@@ -180,6 +184,6 @@ def my_progress(percent, rate, eta_seconds, completed, total):
 send_emails_smtp.main(root_dir, project_names=[...], progress_callback=my_progress)
 ```
 
-### 19. 发送失败后的文件处理
+### 17. 发送失败后的文件处理
 
 - 若对某个供应商的所有重试均失败，脚本会将该供应商对应的附件文件从该项目的 `待外发/` 目录移动到该项目目录下的 `failed/` 子目录，便于人工后续处理与排查。日志中会记录移动操作与任何移动失败的错误信息。
