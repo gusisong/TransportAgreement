@@ -1,0 +1,26 @@
+# ignore local smtp config with credentials
+/dev/smtp_config.ini
+smtp_config.ini
+
+# ignore virtual environment
+.venv/
+
+# build artifacts
+build/
+dist/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# log files
+*.log
+
+# sensitive data
+EmailAddress.csv
+
+# Excel files
+*.xlsx
+
+# IDE / editor
+.gemini/
