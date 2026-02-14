@@ -186,10 +186,13 @@ def _build_message(from_addr, to_emails, cc_email, subject, body_html, attachmen
     return msg, recipients
 
 
-def _create_smtp_connection(smtp_config):
+def _create_smtp_connection(smtp_config, max_attempts=3, stop_event=None):
     """
-    创建并登录 SMTP 连接。
+    创建并登录 SMTP 连接，失败时自动重试。
+    @param max_attempts {int} 最大尝试次数（含首次）
+    @param stop_event {threading.Event|None} 取消事件
     @returns {smtplib.SMTP} 已登录的 SMTP 连接
+    @raises Exception 所有尝试均失败时抛出最后一个异常
     """
     host = smtp_config["host"]
     port = smtp_config["port"]
@@ -198,15 +201,35 @@ def _create_smtp_connection(smtp_config):
     username = smtp_config["username"]
     password = smtp_config["password"]
 
-    if use_ssl:
-        server = smtplib.SMTP_SSL(host, port, timeout=30)
-    else:
-        server = smtplib.SMTP(host, port, timeout=30)
-    if use_tls and not use_ssl:
-        server.starttls()
-    if username or password:
-        server.login(username, password)
-    return server
+    last_err = None
+    delay = 10.0  # 首次重试等 10s
+    for attempt in range(max_attempts):
+        if stop_event is not None and stop_event.is_set():
+            raise Exception("用户已取消")
+        try:
+            if use_ssl:
+                server = smtplib.SMTP_SSL(host, port, timeout=30)
+            else:
+                server = smtplib.SMTP(host, port, timeout=30)
+            if use_tls and not use_ssl:
+                server.starttls()
+            if username or password:
+                server.login(username, password)
+            return server
+        except Exception as e:
+            last_err = e
+            if attempt < max_attempts - 1:
+                logging.warning(f"SMTP 连接失败 (第 {attempt+1}/{max_attempts} 次): {e}，{delay:.0f}s 后重试…")
+                # 可中断的等待
+                remaining = delay
+                while remaining > 0:
+                    if stop_event is not None and stop_event.is_set():
+                        raise Exception("用户已取消")
+                    s = min(0.5, remaining)
+                    time.sleep(s)
+                    remaining -= s
+                delay = min(delay * 2, 60.0)
+    raise last_err
 
 
 def send_one_email(smtp_config, to_emails, cc_email, subject, body_html, attachment_paths, server=None):
@@ -447,6 +470,7 @@ def main(
     cooldown_until = 0.0
     # 复用 SMTP 连接
     smtp_server = None
+    consecutive_conn_failures = 0
 
     try:
       for project_folder, supplier_code, files in tasks:
@@ -474,14 +498,19 @@ def main(
             logging.info(f"全局冷却中，等待 {wait_for:.1f}s 后继续发送")
             time.sleep(wait_for)
 
-        # 确保 SMTP 连接可用
+        # 确保 SMTP 连接可用（含重试）
         if smtp_server is None:
             try:
-                smtp_server = _create_smtp_connection(smtp_config)
+                smtp_server = _create_smtp_connection(smtp_config, stop_event=stop_event)
+                consecutive_conn_failures = 0
             except Exception as e:
                 logging.error(f"{log_prefix}SMTP 连接失败: {e}")
                 result["failed"] += 1
                 completed += 1
+                consecutive_conn_failures += 1
+                if consecutive_conn_failures >= 3:
+                    logging.error("连续 3 次 SMTP 连接失败，服务器可能不可用，终止发送。")
+                    break
                 continue
 
         logging.info(f"{log_prefix}正在发送邮件到 {to_email}，附件数量: {len(files)}")
